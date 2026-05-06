@@ -18,7 +18,15 @@ C:\Users\<user>\AppData\Roaming\Antigravity\logs\<latest session>\window1\exthos
 - **12 lines or fewer** = language server started but never received models → auth/config issue
 - **227+ lines with "SupercompleteProvider"** = working session
 
-### Step 2: Check for git errors in exthost.log
+### Step 2: Check renderer.log for agentSessions error
+```
+C:\Users\<user>\AppData\Roaming\Antigravity\logs\<latest session>\window1\renderer.log
+```
+- `[createInstance] ooe depends on UNKNOWN service agentSessions` = chat DI failure
+  → Gemini UI loads and shows models, accepts messages, but NEVER calls streamGenerate
+  → Fix: remove `worktreeConfig = true` from `.git/config` (see Fix 1 below)
+
+### Step 3: Check for git errors in exthost.log
 ```
 C:\Users\<user>\AppData\Roaming\Antigravity\logs\<latest session>\window1\exthost\exthost.log
 ```
@@ -29,23 +37,39 @@ C:\Users\<user>\AppData\Roaming\Antigravity\logs\<latest session>\window1\exthos
 
 ## Fixes (try in order)
 
-### Fix 1: Re-authenticate (most common cause)
+### Fix 1: Remove worktreeConfig from .git/config (VERIFIED — session 15)
+This fixes the `agentSessions UNKNOWN service` DI error that causes silent message dropping.
+
+1. Open `.git/config` in the Antigravity workspace root
+2. Remove the entire `[extensions]` block:
+   ```
+   [extensions]
+       worktreeConfig = true
+   ```
+3. Kill ALL Antigravity processes (task manager, not just close window)
+4. Restart Antigravity
+
+Verification: send a test message in the chat panel — Gemini should respond within 2-3s.
+Note: removing `worktreeConfig` disables per-worktree git config overrides. Claude Code
+worktrees still function; only their worktree-specific config files are ignored.
+
+### Fix 2: Re-authenticate
 1. Open Antigravity
 2. `Ctrl+Shift+P` → type **"Gemini: Sign In"**
 3. Complete the browser OAuth flow
 4. Restart Antigravity
 
-### Fix 2: Sign out and back in
+### Fix 3: Sign out and back in
 1. `Ctrl+Shift+P` → **"Gemini: Sign Out"**
-2. Restart Antigravity completely (close all windows)
+2. Restart Antigravity completely (kill all processes)
 3. `Ctrl+Shift+P` → **"Gemini: Sign In"**
 
-### Fix 3: Switch to lower-tier model (quota exhausted)
+### Fix 4: Switch to lower-tier model (quota exhausted)
 - Click the model selector in the bottom-right of Antigravity
-- Switch from **Gemini 3 Pro High** → **Gemini 3 Pro (Standard)** or **Low**
-- Exhausting quota on one model locks out all models until the quota window resets
+- Switch from **Gemini 3.1 Pro High** → **Gemini 3.1 Pro (Low)** or **Gemini 3 Flash**
+- Exhausting quota on one model can lock out response generation
 
-### Fix 4: Wait out rate limiting
+### Fix 5: Wait out rate limiting
 - HTTP 429 rate limits are separate from daily quota — the quota meter shows fine but per-minute limits are hit
 - Wait 5-15 minutes, retry during off-peak hours
 
@@ -73,5 +97,6 @@ C:\Users\<user>\AppData\Roaming\Antigravity\logs\<latest session>\window1\exthos
   tries to set the URL). Not the cause of Gemini failing.
 
 ## Verified
-- 2026-05-06, session 15 — diagnosed via exthost.log git flood + missing cloudProject setting
-- Source: discuss.ai.google.dev/t/gemini-disabled-on-antigravity-ide/122177
+- 2026-05-06, session 15 — Fix 1 (remove worktreeConfig) confirmed working. Gemini responded
+  "WORKING" within 2s after clean restart. Antigravity v1.23.2, PKA testing workspace.
+  Diagnosis path: renderer.log agentSessions error → .git/config worktreeConfig = true → remove → restart → live.
