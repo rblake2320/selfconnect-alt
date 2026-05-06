@@ -64,5 +64,8 @@ jobs:
       - name: Syntax check — claudego
         run: python -m py_compile claudego/__main__.py claudego/scanner.py claudego/dashboard.py claudego/tray.py claudego/notifier.py
 
+      - name: Syntax check — runbook_writer
+        run: python -m py_compile runbook_writer.py
+
       - name: Unit tests (no Win32 desktop needed)
         run: python -m pytest tests/ -v --tb=short

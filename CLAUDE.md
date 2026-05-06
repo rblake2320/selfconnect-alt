@@ -11,6 +11,22 @@ Repo: https://github.com/rblake2320/selfconnect
 
 ---
 
+## Runbooks (check BEFORE attempting any multi-step Win32 operation)
+
+Structured, session-proven procedures live in `runbooks/`. Read the relevant runbook before
+starting — it has working code, DPI notes, and known failures already documented.
+
+```bash
+ls runbooks/   # see what's available
+```
+
+If you succeed at something after 3+ retry attempts, write it down:
+```bash
+python runbook_writer.py --title "What I did" --what "What it achieves" --step "Step 1" --session 15
+```
+
+---
+
 ## Critical Win32 Gotchas (learned the hard way — do not repeat these mistakes)
 
 1. **`PostMessage(WM_CHAR)` works for ConPTY text input.** Background-safe — window does NOT
