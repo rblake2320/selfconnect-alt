@@ -73,6 +73,14 @@
   .terminal-title { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .terminal-hwnd  { font-size: 11px; color: var(--muted); font-family: monospace; }
   .terminal-status { font-size: 12px; font-weight: 500; }
+  .agent-type-badge {
+    font-size: 10px; font-weight: 600; border-radius: 4px; padding: 2px 6px;
+    text-transform: uppercase; letter-spacing: 0.4px; flex-shrink: 0;
+  }
+  .at-claude_code  { background: rgba(99,102,241,0.2); color: #a5b4fc; }
+  .at-local_model  { background: rgba(16,185,129,0.2); color: #6ee7b7; }
+  .at-observer     { background: rgba(251,191,36,0.2);  color: #fcd34d; }
+  .at-unknown      { background: rgba(255,255,255,0.06); color: var(--muted); }
   .terminal-status.approval_needed { color: var(--yellow); }
   .terminal-status.working  { color: var(--green); }
   .terminal-status.stuck    { color: var(--red); }
@@ -286,7 +294,7 @@ function handleEvent(evt) {
 
   switch (evt.event_type) {
     case 'terminal_discovered':
-      state.terminals[evt.hwnd] = { hwnd: evt.hwnd, title: evt.title, status: 'idle', pending_tool: null };
+      state.terminals[evt.hwnd] = { hwnd: evt.hwnd, title: evt.title, status: 'idle', agent_type: evt.agent_type || 'unknown', pending_tool: null };
       break;
     case 'terminal_lost':
       delete state.terminals[evt.hwnd];
@@ -335,6 +343,9 @@ function renderTerminals() {
     const statusClass = t.status === 'approval_needed' ? 'approval' : t.status;
     const dotClass = `status-dot s-${statusClass}`;
     const statusLabel = t.status.replace(/_/g, ' ');
+    const agentType = t.agent_type || 'unknown';
+    const agentLabels = { claude_code: 'Claude', local_model: 'Local Model', observer: 'Observer', unknown: '?' };
+    const agentLabel = agentLabels[agentType] || agentType;
     return `
       <div class="terminal-item">
         <div class="${dotClass}"></div>
@@ -342,6 +353,7 @@ function renderTerminals() {
           <div class="terminal-title" title="${esc(t.title)}">${esc(t.title)}</div>
           <div class="terminal-hwnd">hwnd=${t.hwnd}${t.pending_tool ? ' · ' + esc(t.pending_tool) : ''}</div>
         </div>
+        <span class="agent-type-badge at-${agentType}">${agentLabel}</span>
         <div class="terminal-status ${t.status}">${statusLabel}</div>
       </div>`;
   }).join('');

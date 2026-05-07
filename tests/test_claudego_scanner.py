@@ -89,6 +89,34 @@ class TestScanEvent:
         after = time.time()
         assert before <= evt.timestamp <= after
 
+    def test_agent_type_in_dict(self):
+        evt = ScanEvent(EVENT_TERMINAL_DISCOVERED, hwnd=1, title="t", agent_type="local_model")
+        assert evt.to_dict()["agent_type"] == "local_model"
+
+
+# ── _detect_agent_type ────────────────────────────────────────────────────────
+
+class TestDetectAgentType:
+    def test_claude_code(self):
+        from claudego.scanner import _detect_agent_type
+        assert _detect_agent_type("claude — airgap-sop") == "claude_code"
+
+    def test_local_model_by_local_agent(self):
+        from claudego.scanner import _detect_agent_type
+        assert _detect_agent_type("Agent-B-local (local_agent.py)") == "local_model"
+
+    def test_local_model_by_agent_b(self):
+        from claudego.scanner import _detect_agent_type
+        assert _detect_agent_type("agent-b running") == "local_model"
+
+    def test_observer(self):
+        from claudego.scanner import _detect_agent_type
+        assert _detect_agent_type("Agent-E-Observer") == "observer"
+
+    def test_unknown(self):
+        from claudego.scanner import _detect_agent_type
+        assert _detect_agent_type("PowerShell 7.4") == "unknown"
+
 
 # ── Scanner ───────────────────────────────────────────────────────────────────
 

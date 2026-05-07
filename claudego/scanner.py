@@ -53,6 +53,7 @@ class ScanEvent:
     title: str
     tool_call: Optional[str] = None
     rule_matched: Optional[str] = None
+    agent_type: Optional[str] = None
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict:
@@ -62,17 +63,34 @@ class ScanEvent:
             "title": self.title,
             "tool_call": self.tool_call,
             "rule_matched": self.rule_matched,
+            "agent_type": self.agent_type,
             "timestamp": self.timestamp,
         }
 
 
 # ── Terminal state ─────────────────────────────────────────────────────────────
 
+def _detect_agent_type(title: str) -> str:
+    """Classify a terminal by its window title.
+
+    Returns one of: 'claude_code', 'local_model', 'observer', 'unknown'
+    """
+    t = title.lower()
+    if any(x in t for x in ("local_agent", "agent-b")):
+        return "local_model"
+    if any(x in t for x in ("agent-e", "observer")):
+        return "observer"
+    if any(x in t for x in ("claude", "anthropic")):
+        return "claude_code"
+    return "unknown"
+
+
 @dataclass
 class TerminalState:
     hwnd: int
     title: str
     status: str = "idle"          # idle | working | approval_needed | stuck | unknown
+    agent_type: str = "unknown"   # claude_code | local_model | observer | unknown
     pending_tool: Optional[str] = None
     last_activity: float = field(default_factory=time.time)
     last_approval_time: float = 0.0
@@ -120,6 +138,7 @@ class Scanner:
                 "hwnd": t.hwnd,
                 "title": t.title,
                 "status": t.status,
+                "agent_type": t.agent_type,
                 "pending_tool": t.pending_tool,
                 "last_activity": t.last_activity,
             }
@@ -204,9 +223,10 @@ class Scanner:
         # Discover new terminals
         for win in live_terminals:
             if win.hwnd not in self._terminals:
-                state = TerminalState(hwnd=win.hwnd, title=win.title)
+                agent_type = _detect_agent_type(win.title)
+                state = TerminalState(hwnd=win.hwnd, title=win.title, agent_type=agent_type)
                 self._terminals[win.hwnd] = state
-                evt = ScanEvent(EVENT_TERMINAL_DISCOVERED, win.hwnd, win.title)
+                evt = ScanEvent(EVENT_TERMINAL_DISCOVERED, win.hwnd, win.title, agent_type=agent_type)
                 self._record(evt)
 
         # Detect lost terminals
@@ -220,7 +240,8 @@ class Scanner:
         # Process each terminal
         for win in live_terminals:
             state = self._terminals[win.hwnd]
-            state.title = win.title  # title may change
+            state.title = win.title        # title may change
+            state.agent_type = _detect_agent_type(win.title)
 
             # Cooldown: don't re-fire approval on same window too quickly
             if now_mono - state.last_approval_time < self.cfg.cooldown:
