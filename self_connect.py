@@ -39,7 +39,7 @@ __all__ = [  # noqa: RUF022  # grouped by version/category, not alphabetical
     "get_own_terminal_pid", "wait_for_window",
     # Focus & management
     "focus_window", "move_window", "resize_window",
-    "minimize_window", "maximize_window", "restore_window",
+    "minimize_window", "maximize_window", "restore_window", "submit_claude_input",
     "get_window_rect",
     # Input: text
     "send_string", "send_keys",
@@ -635,6 +635,28 @@ def maximize_window(hwnd: int) -> bool:
 def restore_window(hwnd: int) -> bool:
     """Restore a minimized/maximized window to normal size."""
     return bool(user32.ShowWindow(hwnd, SW_RESTORE))
+
+
+def submit_claude_input(hwnd: int) -> bool:
+    """
+    Submit the text currently in a Claude Code (Ink TUI) input bar.
+
+    Claude Code's Ink TUI does NOT respond to:
+      - PostMessage(WM_KEYDOWN, VK_RETURN)
+      - SendInput(VK_RETURN) even after SetForegroundWindow
+
+    The only working method found (session 15, 2026-05-07) is
+    PostMessage(WM_CHAR, 0x000D) to the parent CASCADIA_HOSTING_WINDOW_CLASS
+    window.  This bypasses the XAML input routing and delivers the carriage
+    return directly to the ConPTY stdin pipe.
+
+    Returns True if the message was posted successfully (PostMessageW != 0).
+    Does NOT guarantee the prompt was processed — poll get_text_uia() to confirm.
+    """
+    WM_CHAR = 0x0102
+    # lParam: repeat=1, scan=0x1C (Enter scancode), extended=0, prior=0, trans=0
+    lParam  = 0x001C0001
+    return bool(user32.PostMessageW(hwnd, WM_CHAR, 0x000D, lParam))
 
 
 # ── Scroll ───────────────────────────────────────────────────────────────────
