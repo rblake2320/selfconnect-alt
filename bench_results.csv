@@ -1,0 +1,7 @@
+operation,original_ms,alt_ms,speedup_factor,notes
+send_string (500 chars),5.88,12.57,0.5x,"orig=PostMessage WM_CHAR, alt=WriteConsoleInput"
+get_ui_tree (depth=5),78.19,25.42,3.1x,"orig=per-element COM, alt=CacheRequest single-call"
+capture_window,18.32,9.2,2.0x,"orig=PrintWindow, alt=dxcam DXGI"
+get_text_uia,37.21,56.63,0.7x,"orig=UIA walker, alt=ReadConsoleOutput"
+submit_claude_input,0.02,12.68,0.0x,"orig=WM_CHAR 0x000D, alt=WriteConsoleInput VK_RETURN"
+IPC roundtrip (shared memory),-1.0,0.0,N/A (no orig equivalent),alt=SharedMemChannel mmap+event; orig uses HTTP hub_relay
