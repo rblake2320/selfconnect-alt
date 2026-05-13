@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "selfconnect"
-version = "0.10.0"
+name = "selfconnect-alt"
+version = "0.10.0-alt"
 description = "OS-native Win32 bridge for AI agent orchestration — PostMessage, PrintWindow, UIA, cross-machine mesh, Telegram approvals, ClaudeGo dashboard."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -44,6 +44,10 @@ claudego = [
     "uvicorn[standard]>=0.34.0",
     "pywinauto>=0.6.8",
 ]
+alt = [
+    "dxcam>=0.0.5",
+    "comtypes>=1.4.0",
+]
 full = [
     "pywinauto>=0.6.8",
     "comtypes>=1.4.0",
@@ -52,6 +56,7 @@ full = [
     "python-telegram-bot>=22.0",
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",
+    "dxcam>=0.0.5",
 ]
 
 [project.urls]

@@ -72,6 +72,16 @@ __all__ = [  # noqa: RUF022  # grouped by version/category, not alphabetical
     "PeerState", "PeerRecord", "AgentRegistry", "WatchdogLoop", "ApprovalRelay",
     # Layer 4 Continuity (v0.9.0) — context-preserving role migration
     "Checkpoint", "write_checkpoint", "read_checkpoint", "MigrationCoordinator",
+    # Console I/O (v0.10.0) — WriteConsoleInput / ReadConsoleOutput
+    "_write_console_input", "_read_console_output", "_resolve_console_pid",
+    # UI tree extraction (v0.10.0) — CacheRequest optimization
+    "get_ui_tree", "_get_ui_tree_cached",
+    # SendInput batching (v0.10.0) — single-syscall string injection
+    "_send_string_batched_sendinput",
+    # Shared memory IPC (v0.10.0) — zero-copy agent-to-agent channel
+    "SharedMemChannel",
+    # ConPTY own-pipe spawn (v0.10.0) — direct pipe I/O to spawned agents
+    "ConPTYHandle", "spawn_agent_conpty",
 ]
 
 import collections
@@ -201,6 +211,265 @@ class BITMAPINFOHEADER(ctypes.Structure):
         ("biClrUsed",       ctypes.c_uint32),
         ("biClrImportant",  ctypes.c_uint32),
     ]
+
+
+# ── Console I/O — WriteConsoleInput / ReadConsoleOutput ──────────────────────
+
+_console_lock = threading.Lock()
+
+ATTACH_PARENT_PROCESS_CONST = 0xFFFFFFFF
+STD_INPUT_HANDLE  = ctypes.c_uint(-10)
+STD_OUTPUT_HANDLE = ctypes.c_uint(-11)
+KEY_EVENT_TYPE = 0x0001
+
+
+class _KEY_EVENT_RECORD_UCHAR(ctypes.Union):
+    _fields_ = [("UnicodeChar", ctypes.c_wchar), ("AsciiChar", ctypes.c_char)]  # noqa: RUF012
+
+
+class _KEY_EVENT_RECORD(ctypes.Structure):
+    _fields_ = [
+        ("bKeyDown",          wintypes.BOOL),
+        ("wRepeatCount",      wintypes.WORD),
+        ("wVirtualKeyCode",   wintypes.WORD),
+        ("wVirtualScanCode",  wintypes.WORD),
+        ("uChar",             _KEY_EVENT_RECORD_UCHAR),
+        ("dwControlKeyState", wintypes.DWORD),
+    ]
+
+
+class _INPUT_RECORD_EVENT(ctypes.Union):
+    _fields_ = [("KeyEvent", _KEY_EVENT_RECORD)]  # noqa: RUF012
+
+
+class _INPUT_RECORD(ctypes.Structure):
+    _fields_ = [("EventType", wintypes.WORD), ("Event", _INPUT_RECORD_EVENT)]
+
+
+class _SMALL_RECT(ctypes.Structure):
+    _fields_ = [("Left", wintypes.SHORT), ("Top", wintypes.SHORT),
+                ("Right", wintypes.SHORT), ("Bottom", wintypes.SHORT)]
+
+
+class _COORD(ctypes.Structure):
+    _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+
+class _CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
+    _fields_ = [
+        ("dwSize",              _COORD),
+        ("dwCursorPosition",    _COORD),
+        ("wAttributes",         wintypes.WORD),
+        ("srWindow",            _SMALL_RECT),
+        ("dwMaximumWindowSize", _COORD),
+    ]
+
+
+class _CHAR_INFO_CHAR(ctypes.Union):
+    _fields_ = [("UnicodeChar", ctypes.c_wchar), ("AsciiChar", ctypes.c_char)]  # noqa: RUF012
+
+
+class _CHAR_INFO(ctypes.Structure):
+    _fields_ = [("Char", _CHAR_INFO_CHAR), ("Attributes", wintypes.WORD)]
+
+
+# ── ConPTY (CreatePseudoConsole) — Windows 10 1809+ (build 17763+) ───────────
+
+PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
+_PSEUDOCONSOLE_INHERIT_CURSOR = 0x1
+
+
+class _STARTUPINFOW(ctypes.Structure):
+    """Win32 STARTUPINFOW — needed for STARTUPINFOEX."""
+    _fields_ = [
+        ("cb",              wintypes.DWORD),
+        ("lpReserved",      wintypes.LPWSTR),
+        ("lpDesktop",       wintypes.LPWSTR),
+        ("lpTitle",         wintypes.LPWSTR),
+        ("dwX",             wintypes.DWORD),
+        ("dwY",             wintypes.DWORD),
+        ("dwXSize",         wintypes.DWORD),
+        ("dwYSize",         wintypes.DWORD),
+        ("dwXCountChars",   wintypes.DWORD),
+        ("dwYCountChars",   wintypes.DWORD),
+        ("dwFillAttribute", wintypes.DWORD),
+        ("dwFlags",         wintypes.DWORD),
+        ("wShowWindow",     wintypes.WORD),
+        ("cbReserved2",     wintypes.WORD),
+        ("lpReserved2",     ctypes.c_void_p),
+        ("hStdInput",       wintypes.HANDLE),
+        ("hStdOutput",      wintypes.HANDLE),
+        ("hStdError",       wintypes.HANDLE),
+    ]
+
+
+class _STARTUPINFOEX(ctypes.Structure):
+    _fields_ = [
+        ("StartupInfo",     _STARTUPINFOW),
+        ("lpAttributeList", ctypes.c_void_p),
+    ]
+
+
+def _resolve_console_pid(target: "WindowTarget") -> int:
+    """Find the console host PID for a Windows Terminal target.
+
+    Windows Terminal hosts each tab via OpenConsole.exe (or conhost.exe).
+    AttachConsole needs the console host PID, not the WT window PID.
+    """
+    try:
+        import psutil
+        proc = psutil.Process(target.pid)
+        for child in proc.children(recursive=True):
+            name = child.name().lower()
+            if name in ("openconsole.exe", "conhost.exe"):
+                return child.pid
+        # Try parent chain too — WT's conhost may be a sibling
+        parent = proc.parent()
+        if parent:
+            for sibling in parent.children():
+                name = sibling.name().lower()
+                if name in ("openconsole.exe", "conhost.exe"):
+                    return sibling.pid
+    except Exception:
+        pass
+    return target.pid
+
+
+def _write_console_input(target_pid: int, text: str) -> bool:
+    """Write text directly to a process's console input buffer via WriteConsoleInputW.
+
+    Background-safe. Single syscall for entire string. Bypasses WM_CHAR window message queue.
+    Fixes Codex injection: Codex reads from ReadConsoleInput (stdin), not WM_CHAR messages.
+
+    Returns True on success, False on failure (caller should fall back to PostMessage).
+    """
+    if not text:
+        return True
+
+    records = []
+    for ch in text:
+        vk = 0
+        scan = 0
+        if ch == '\r' or ch == '\n':
+            vk = 0x0D   # VK_RETURN
+            scan = 0x1C
+
+        # Key down
+        r_down = _INPUT_RECORD()
+        r_down.EventType = KEY_EVENT_TYPE
+        r_down.Event.KeyEvent.bKeyDown = True
+        r_down.Event.KeyEvent.wRepeatCount = 1
+        r_down.Event.KeyEvent.wVirtualKeyCode = vk
+        r_down.Event.KeyEvent.wVirtualScanCode = scan
+        r_down.Event.KeyEvent.uChar.UnicodeChar = ch
+        r_down.Event.KeyEvent.dwControlKeyState = 0
+        records.append(r_down)
+
+        # Key up
+        r_up = _INPUT_RECORD()
+        r_up.EventType = KEY_EVENT_TYPE
+        r_up.Event.KeyEvent.bKeyDown = False
+        r_up.Event.KeyEvent.wRepeatCount = 1
+        r_up.Event.KeyEvent.wVirtualKeyCode = vk
+        r_up.Event.KeyEvent.wVirtualScanCode = scan
+        r_up.Event.KeyEvent.uChar.UnicodeChar = ch
+        r_up.Event.KeyEvent.dwControlKeyState = 0
+        records.append(r_up)
+
+    arr = (_INPUT_RECORD * len(records))(*records)
+    written = wintypes.DWORD(0)
+
+    with _console_lock:
+        kernel32.FreeConsole()
+        if not kernel32.AttachConsole(wintypes.DWORD(target_pid)):
+            kernel32.AttachConsole(wintypes.DWORD(ATTACH_PARENT_PROCESS_CONST))
+            return False
+        try:
+            # GetStdHandle returns stale handle after AttachConsole — open CONIN$ directly
+            GENERIC_READ  = 0x80000000
+            GENERIC_WRITE = 0x40000000
+            OPEN_EXISTING = 3
+            FILE_SHARE_READ_WRITE = 0x03
+            h_stdin = kernel32.CreateFileW(
+                "CONIN$", GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ_WRITE, None, OPEN_EXISTING, 0, None,
+            )
+            if not h_stdin or h_stdin == wintypes.HANDLE(-1).value:
+                return False
+            try:
+                ok = kernel32.WriteConsoleInputW(h_stdin, arr, len(records), ctypes.byref(written))
+                return bool(ok) and written.value > 0
+            finally:
+                kernel32.CloseHandle(h_stdin)
+        except Exception:
+            return False
+        finally:
+            kernel32.FreeConsole()
+            kernel32.AttachConsole(wintypes.DWORD(ATTACH_PARENT_PROCESS_CONST))
+
+
+def _read_console_output(target_pid: int) -> str | None:
+    """Read the console screen buffer directly via ReadConsoleOutputW.
+
+    Background-safe. Returns character grid as string. Much faster than UIA text extraction.
+    Returns None on failure (caller falls back to existing methods).
+    """
+    with _console_lock:
+        kernel32.FreeConsole()
+        if not kernel32.AttachConsole(wintypes.DWORD(target_pid)):
+            kernel32.AttachConsole(wintypes.DWORD(ATTACH_PARENT_PROCESS_CONST))
+            return None
+        try:
+            # GetStdHandle returns stale handle after AttachConsole — open CONOUT$ directly
+            GENERIC_READ  = 0x80000000
+            GENERIC_WRITE = 0x40000000
+            OPEN_EXISTING = 3
+            FILE_SHARE_READ_WRITE = 0x03
+            h_out = kernel32.CreateFileW(
+                "CONOUT$", GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ_WRITE, None, OPEN_EXISTING, 0, None,
+            )
+            if not h_out or h_out == wintypes.HANDLE(-1).value:
+                return None
+
+            try:
+                csbi = _CONSOLE_SCREEN_BUFFER_INFO()
+                if not kernel32.GetConsoleScreenBufferInfo(h_out, ctypes.byref(csbi)):
+                    return None
+
+                # Read the visible window region
+                win = csbi.srWindow
+                width  = win.Right  - win.Left  + 1
+                height = win.Bottom - win.Top   + 1
+
+                buf_size  = _COORD(width, height)
+                buf_coord = _COORD(0, 0)
+                region    = _SMALL_RECT(win.Left, win.Top, win.Right, win.Bottom)
+
+                buf = (_CHAR_INFO * (width * height))()
+                if not kernel32.ReadConsoleOutputW(h_out, buf, buf_size, buf_coord, ctypes.byref(region)):
+                    return None
+
+                lines = []
+                for row in range(height):
+                    line = "".join(
+                        buf[row * width + col].Char.UnicodeChar
+                        for col in range(width)
+                    ).rstrip()
+                    lines.append(line)
+
+                # Strip trailing blank lines
+                while lines and not lines[-1]:
+                    lines.pop()
+                return "\n".join(lines)
+            finally:
+                kernel32.CloseHandle(h_out)
+
+        except Exception:
+            return None
+        finally:
+            kernel32.FreeConsole()
+            kernel32.AttachConsole(wintypes.DWORD(ATTACH_PARENT_PROCESS_CONST))
 
 
 # ── WindowTarget ──────────────────────────────────────────────────────────────
@@ -394,9 +663,16 @@ def _send_char_sendinput(ch: str) -> None:
         user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
 
-def send_string(target: WindowTarget, text: str, char_delay: float = 0.05) -> None:
+def send_string(target: WindowTarget, text: str, char_delay: float = 0.05,
+                mode: str = "auto") -> None:
     """
-    Send text to the target window. Auto-selects delivery method:
+    Send text to the target window. Auto-selects delivery method.
+
+    Modes:
+      - "auto" (default): try WriteConsoleInput first, fall back to PostMessage/SendInput
+      - "console": ONLY WriteConsoleInput, no fallback (for Codex and stdin-reading apps)
+      - "turbo": same as auto — WriteConsoleInput first, then PostMessage (no per-char delay)
+      - "postmessage": legacy PostMessage(WM_CHAR) only (original behavior)
 
     - Windows Terminal (CASCADIA_HOSTING_WINDOW_CLASS): PostMessage(WM_CHAR) to
       the InputSite child, routed through ConPTY. Does NOT require foreground
@@ -410,6 +686,17 @@ def send_string(target: WindowTarget, text: str, char_delay: float = 0.05) -> No
     Verified: one Claude session can inject text into another Claude session's
     terminal window without stealing foreground focus (2026-04-30 live proof).
     """
+    # Console injection mode — direct WriteConsoleInput (fastest, fixes Codex)
+    if mode in ("console", "auto", "turbo"):
+        try:
+            cpid = _resolve_console_pid(target)
+            if _write_console_input(cpid, text):
+                return
+        except Exception:
+            pass
+        if mode == "console":
+            return  # console mode — no fallback
+
     if target.is_uwp_terminal():
         input_site = find_child_by_class(target.hwnd, WT_INPUT_CLASS)
         delivery = input_site if input_site else target.hwnd
@@ -458,6 +745,9 @@ def send_keys(*keys: str) -> None:
         send_keys("alt", "tab")       # Alt+Tab
         send_keys("enter")            # Enter
         send_keys("f5")               # F5
+
+    Note: For sending full strings (not key combos), use _send_string_batched_sendinput()
+    which batches all keystrokes into a single SendInput syscall for atomicity and speed.
     """
     if not keys:
         return
@@ -484,6 +774,38 @@ def send_keys(*keys: str) -> None:
         inp.u.ki.time = 0
         inp.u.ki.dwExtraInfo = extra
         user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+
+def _send_string_batched_sendinput(text: str) -> None:
+    """Send a string via SendInput with ALL keystrokes in a single batched syscall.
+
+    Replaces per-character SendInput(1, ...) calls with SendInput(N, array, sizeof).
+    For 500 chars: 1 syscall vs 1000. Atomic — no other input can interleave.
+    Requires foreground window (SendInput limitation — use send_string/WriteConsoleInput
+    for background).
+
+    For full strings, prefer this over send_keys() which is designed for key combos.
+    """
+    if not text:
+        return
+
+    extra = ctypes.pointer(ctypes.c_ulong(0))
+
+    events = []
+    for ch in text:
+        scan = ord(ch)
+        for flags in (KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP):
+            inp = INPUT()
+            inp.type = INPUT_KEYBOARD
+            inp.u.ki.wVk = 0
+            inp.u.ki.wScan = scan
+            inp.u.ki.dwFlags = flags
+            inp.u.ki.time = 0
+            inp.u.ki.dwExtraInfo = extra
+            events.append(inp)
+
+    arr = (INPUT * len(events))(*events)
+    user32.SendInput(len(events), arr, ctypes.sizeof(INPUT))
 
 
 # ── Window text (zero-inference) ─────────────────────────────────────────────
@@ -529,6 +851,18 @@ def get_text_uia(hwnd: int) -> str:
         t = find_target('Notepad')
         text = get_text_uia(t.hwnd)
     """
+    # Strategy 0: ReadConsoleOutput — direct character grid for console windows
+    try:
+        for w in list_windows():
+            if w.hwnd == hwnd:
+                cpid = _resolve_console_pid(w)
+                result = _read_console_output(cpid)
+                if result is not None:
+                    return result
+                break
+    except Exception:
+        pass
+
     # Strategy 1: pywinauto
     try:
         import pythoncom as _pcom  # type: ignore
@@ -653,6 +987,18 @@ def submit_claude_input(hwnd: int) -> bool:
     Returns True if at least the parent post succeeded.
     Does NOT guarantee the prompt was processed — poll get_text_uia() to confirm.
     """
+    # Try WriteConsoleInput first — works for Codex and any console process
+    # (Codex reads from stdin/ReadConsoleInput, not WM_CHAR)
+    for w in list_windows():
+        if w.hwnd == hwnd:
+            try:
+                cpid = _resolve_console_pid(w)
+                if _write_console_input(cpid, '\r'):
+                    return True
+            except Exception:
+                pass
+            break
+
     WM_CHAR = 0x0102
     lParam  = 0x001C0001  # repeat=1, scan=0x1C (Enter), extended=0
 
@@ -721,12 +1067,68 @@ def wait_for_title_change(hwnd: int, old_title: str, timeout: float = 15.0,
 
 
 # ── Capture ───────────────────────────────────────────────────────────────────
+def _capture_dxcam(hwnd: int):
+    """Capture a window using DXGI desktop duplication (GPU-level).
+
+    Works for GPU-composited windows (Chrome, Edge, Electron, DirectX apps)
+    where PrintWindow returns black. Requires dxcam package.
+    Returns PIL Image or None on failure.
+    """
+    try:
+        import dxcam
+
+        # Get window rect
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+
+        left   = rect.left
+        top    = rect.top
+        right  = rect.right
+        bottom = rect.bottom
+
+        if right <= left or bottom <= top:
+            return None
+
+        # Determine which monitor contains this window
+        MONITOR_DEFAULTTONEAREST = 2
+        user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+
+        # dxcam.create() defaults to primary monitor; for multi-monitor use device_idx
+        camera = dxcam.create()
+        if camera is None:
+            return None
+
+        try:
+            frame = camera.grab(region=(left, top, right, bottom))
+            if frame is None:
+                return None
+            from PIL import Image
+            # dxcam returns BGR numpy array
+            img = Image.fromarray(frame[:, :, :3][:, :, ::-1])  # BGR → RGB
+            return img
+        finally:
+            del camera
+    except Exception:
+        return None
+
+
 def capture_window(hwnd: int):
     """
     Capture a window to a PIL Image.
-    Tries PrintWindow (PW_RENDERFULLCONTENT) first; falls back to BitBlt from desktop.
+    Tries dxcam DXGI first (GPU-composited windows), then PrintWindow
+    (PW_RENDERFULLCONTENT), then BitBlt from desktop.
     Returns PIL Image in RGB mode, or None on failure.
     """
+    # Strategy 0: dxcam DXGI — GPU-level capture, works for Chrome/Electron/DirectX
+    try:
+        img = _capture_dxcam(hwnd)
+        if img is not None:
+            return img
+    except Exception:
+        pass
+    # Fall through to PrintWindow / BitBlt strategies...
+
     try:
         from PIL import Image
     except ImportError:
@@ -2574,6 +2976,847 @@ class MigrationCoordinator:
     def has_migrated(self) -> bool:
         """True if migration has been triggered for this instance."""
         return self._migrated
+
+
+# ── Shared Memory IPC ────────────────────────────────────────────────────────
+class SharedMemChannel:
+    """Zero-copy agent-to-agent IPC via named shared memory.
+
+    Orders of magnitude faster than HTTP hub relay for same-machine agent communication.
+    Uses Python mmap with named tagname + Windows Event for notification.
+
+    Usage:
+        # Agent A (writer)
+        ch = SharedMemChannel("SelfConnect_AgentA")
+        ch.send(b"hello from A")
+
+        # Agent B (reader, different process)
+        ch = SharedMemChannel("SelfConnect_AgentA")
+        data = ch.recv(timeout=5.0)  # blocks up to 5s
+    """
+
+    _HEADER_SIZE = 16  # [4 bytes: length][4 bytes: sequence][8 bytes: reserved]
+
+    def __init__(self, name: str, size: int = 1_048_576) -> None:
+        import mmap
+        self._name     = name
+        self._size     = size
+        self._mmap     = mmap.mmap(-1, size, tagname=name)
+        self._seq      = 0
+        # Named event for notification (auto-reset, initially non-signaled)
+        self._event = kernel32.CreateEventW(None, False, False, f"SelfConnect_Event_{name}")
+
+    def send(self, data: bytes) -> None:
+        """Write data to shared memory and signal the reader event."""
+        import struct
+        if len(data) + self._HEADER_SIZE > self._size:
+            raise ValueError(f"Data too large: {len(data)} bytes exceeds channel capacity")
+        self._seq += 1
+        header = struct.pack("<II8s", len(data), self._seq, b'\x00' * 8)
+        self._mmap.seek(0)
+        self._mmap.write(header + data)
+        self._mmap.flush()
+        kernel32.SetEvent(self._event)
+
+    def recv(self, timeout: float = 1.0) -> bytes | None:
+        """Wait for data and read it. Returns None on timeout."""
+        import struct
+        WAIT_OBJECT_0 = 0
+        timeout_ms = int(timeout * 1000)
+        result = kernel32.WaitForSingleObject(self._event, timeout_ms)
+        if result != WAIT_OBJECT_0:
+            return None
+        self._mmap.seek(0)
+        header = self._mmap.read(self._HEADER_SIZE)
+        length, seq, _ = struct.unpack("<II8s", header)
+        if length == 0 or length > self._size - self._HEADER_SIZE:
+            return None
+        return self._mmap.read(length)
+
+    def close(self) -> None:
+        """Release shared memory and event handle."""
+        try:
+            self._mmap.close()
+        except Exception:
+            pass
+        try:
+            kernel32.CloseHandle(self._event)
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+# ── UI Tree Extraction ───────────────────────────────────────────────────────
+
+
+def _get_ui_tree_cached(hwnd: int, max_depth: int = 10) -> "list[dict] | None":
+    """Extract UI tree using UIA CacheRequest — fetches all properties in one COM call.
+
+    10-100x faster than per-element COM calls. Returns same dict format as get_ui_tree().
+    Returns None if comtypes/CacheRequest is unavailable (caller falls back to original).
+    """
+    try:
+        import comtypes.client as _cc  # type: ignore
+        import comtypes.gen.UIAutomationClient as _uia_gen  # type: ignore
+
+        # Get IUIAutomation interface (must specify interface — IUnknown has no UIA methods)
+        _uia_clsid = "{ff48dba4-60ef-4201-aa87-54103eef594e}"
+        _IUIAutomation = None
+        try:
+            _IUIAutomation = _cc.CreateObject(
+                _uia_clsid,
+                interface=_uia_gen.IUIAutomation,
+            )
+        except Exception:
+            return None
+
+        # UIA property IDs
+        UIA_NamePropertyId = 30005
+        UIA_ControlTypePropertyId = 30003
+        UIA_ClassNamePropertyId = 30012
+        UIA_AutomationIdPropertyId = 30011
+        UIA_BoundingRectanglePropertyId = 30001
+        UIA_IsEnabledPropertyId = 30010
+        UIA_ValueValuePropertyId = 30045
+
+        # UIA pattern IDs
+        UIA_InvokePatternId = 10000
+        UIA_ValuePatternId = 10002
+        UIA_TogglePatternId = 10015
+        UIA_ExpandCollapsePatternId = 10005
+        UIA_SelectionItemPatternId = 10010
+        UIA_ScrollPatternId = 10004
+
+        # UIA control type ID -> name mapping
+        _CONTROL_TYPE_NAMES = {
+            50000: "Button", 50001: "Calendar", 50002: "CheckBox",
+            50003: "ComboBox", 50004: "Edit", 50005: "Hyperlink",
+            50006: "Image", 50007: "ListItem", 50008: "List",
+            50009: "Menu", 50010: "MenuBar", 50011: "MenuItem",
+            50012: "ProgressBar", 50013: "RadioButton", 50014: "ScrollBar",
+            50015: "Slider", 50016: "Spinner", 50017: "StatusBar",
+            50018: "Tab", 50019: "TabItem", 50020: "Text",
+            50021: "ToolBar", 50022: "ToolTip", 50023: "Tree",
+            50024: "TreeItem", 50025: "Custom", 50026: "Group",
+            50027: "Thumb", 50028: "DataGrid", 50029: "DataItem",
+            50030: "Document", 50031: "SplitButton", 50032: "Window",
+            50033: "Pane", 50034: "Header", 50035: "HeaderItem",
+            50036: "Table", 50037: "TitleBar", 50038: "Separator",
+        }
+
+        # Build cache request
+        cache_req = _IUIAutomation.CreateCacheRequest()
+        for prop_id in (UIA_NamePropertyId, UIA_ControlTypePropertyId,
+                        UIA_ClassNamePropertyId, UIA_AutomationIdPropertyId,
+                        UIA_BoundingRectanglePropertyId, UIA_IsEnabledPropertyId,
+                        UIA_ValueValuePropertyId):
+            try:
+                cache_req.AddProperty(prop_id)
+            except Exception:
+                pass
+
+        # TreeScope_Subtree = 7 (Element=1 | Children=2 | Descendants=4)
+        cache_req.TreeScope = 7
+
+        # Fetch entire subtree in ONE COM call
+        root_elem = _IUIAutomation.ElementFromHandleBuildCache(hwnd, cache_req)
+        if root_elem is None:
+            return None
+
+        def _elem_to_dict(elem, depth: int) -> "dict | None":
+            if depth > max_depth:
+                return None
+            try:
+                # All cached — no COM round trips
+                name = (elem.CachedName or "").strip()
+                ct_id = elem.CachedControlType
+                ct_name = _CONTROL_TYPE_NAMES.get(ct_id, f"Type{ct_id}")
+                cls = (elem.CachedClassName or "").strip()
+                aid = (elem.CachedAutomationId or "").strip()
+                enabled = bool(elem.CachedIsEnabled)
+
+                # Bounding rect
+                try:
+                    r = elem.CachedBoundingRectangle
+                    rect = {"left": int(r.left), "top": int(r.top),
+                            "right": int(r.right), "bottom": int(r.bottom)}
+                except Exception:
+                    rect = {"left": 0, "top": 0, "right": 0, "bottom": 0}
+
+                # Value (cached)
+                try:
+                    value = (elem.CachedValueValue or "").strip()
+                except Exception:
+                    value = ""
+
+                # Patterns — check by trying to get the cached pattern
+                patterns = []
+                _pattern_map = {
+                    "Invoke":         UIA_InvokePatternId,
+                    "Value":          UIA_ValuePatternId,
+                    "Toggle":         UIA_TogglePatternId,
+                    "ExpandCollapse": UIA_ExpandCollapsePatternId,
+                    "SelectionItem":  UIA_SelectionItemPatternId,
+                    "Scroll":         UIA_ScrollPatternId,
+                }
+                for pname, pid in _pattern_map.items():
+                    try:
+                        pat = elem.GetCachedPattern(pid)
+                        if pat is not None:
+                            patterns.append(pname)
+                    except Exception:
+                        pass
+
+                # Children (cached)
+                children = []
+                try:
+                    kids = elem.GetCachedChildren()
+                    if kids:
+                        for i in range(kids.Length):
+                            child_elem = kids.GetElement(i)
+                            child_dict = _elem_to_dict(child_elem, depth + 1)
+                            if child_dict is not None:
+                                children.append(child_dict)
+                except Exception:
+                    pass
+
+                return {
+                    "name":         name,
+                    "control_type": ct_name,
+                    "class_name":   cls,
+                    "automation_id": aid,
+                    "rect":         rect,
+                    "is_enabled":   enabled,
+                    "patterns":     patterns,
+                    "value":        value,
+                    "children":     children,
+                }
+            except Exception:
+                return None
+
+        result = _elem_to_dict(root_elem, 0)
+        return [result] if result else None
+
+    except Exception:
+        return None
+
+
+def get_ui_tree(hwnd: int, max_depth: int = 10) -> list:
+    """Extract the full UI Automation tree from a window.
+
+    Returns a list of dicts (depth-first order), each representing one UI element:
+    {
+        "name":          "Save",
+        "control_type":  "Button",
+        "class_name":    "Button",
+        "automation_id": "btnSave",
+        "rect":          {"left": 340, "top": 500, "right": 420, "bottom": 530},
+        "is_enabled":    True,
+        "patterns":      ["Invoke"],
+        "value":         "",
+        "children":      [...]
+    }
+
+    Strategy 0: UIA CacheRequest (10-100x faster -- single COM call for entire subtree).
+    Strategy 1: pywinauto (richest metadata).
+    Strategy 2: comtypes IUIAutomation tree walker (fallback).
+
+    Args:
+        hwnd:      Window handle.
+        max_depth: Maximum tree depth to traverse (default 10). Use lower values
+                   for apps with deep DOM-backed trees (Chrome, VS Code).
+    """
+    # Strategy 0: UIA CacheRequest -- fetches entire subtree in one COM call (10-100x faster)
+    try:
+        cached_result = _get_ui_tree_cached(hwnd, max_depth)
+        if cached_result is not None:
+            return cached_result
+    except Exception:
+        pass
+    # Fall through to existing strategies (pywinauto, comtypes walker)...
+
+    # Strategy 1: pywinauto
+    try:
+        import pythoncom as _pcom  # type: ignore
+        from pywinauto import Desktop as _PwaDesktop  # type: ignore
+
+        try:
+            _pcom.CoInitializeEx(_pcom.COINIT_MULTITHREADED)
+        except Exception:
+            pass
+
+        desktop = _PwaDesktop(backend="uia")
+        wrapper = desktop.window(handle=hwnd)
+
+        def _pwa_patterns(w) -> list:
+            patterns = []
+            try:
+                if w.iface_invoke:
+                    patterns.append("Invoke")
+            except Exception:
+                pass
+            try:
+                if w.iface_value:
+                    patterns.append("Value")
+            except Exception:
+                pass
+            try:
+                if w.iface_toggle:
+                    patterns.append("Toggle")
+            except Exception:
+                pass
+            try:
+                if w.iface_selection:
+                    patterns.append("Selection")
+            except Exception:
+                pass
+            try:
+                if w.iface_expand_collapse:
+                    patterns.append("ExpandCollapse")
+            except Exception:
+                pass
+            try:
+                if w.iface_scroll:
+                    patterns.append("Scroll")
+            except Exception:
+                pass
+            try:
+                if w.iface_selection_item:
+                    patterns.append("SelectionItem")
+            except Exception:
+                pass
+            return patterns
+
+        def _pwa_value(w) -> str:
+            try:
+                if w.iface_value:
+                    return w.iface_value.CurrentValue or ""
+            except Exception:
+                pass
+            return ""
+
+        def _pwa_rect(w) -> dict:
+            try:
+                r = w.element_info.rectangle
+                return {"left": r.left, "top": r.top, "right": r.right, "bottom": r.bottom}
+            except Exception:
+                return {"left": 0, "top": 0, "right": 0, "bottom": 0}
+
+        def _build_node(w, depth: int) -> dict:
+            info = w.element_info
+            ct = ""
+            try:
+                ct = str(info.control_type or "")
+            except Exception:
+                pass
+            name = ""
+            try:
+                name = info.name or ""
+            except Exception:
+                pass
+            class_name = ""
+            try:
+                class_name = info.class_name or ""
+            except Exception:
+                pass
+            auto_id = ""
+            try:
+                auto_id = info.automation_id or ""
+            except Exception:
+                pass
+            is_enabled = True
+            try:
+                is_enabled = bool(info.enabled)
+            except Exception:
+                pass
+
+            node: dict = {
+                "name": name,
+                "control_type": ct,
+                "class_name": class_name,
+                "automation_id": auto_id,
+                "rect": _pwa_rect(w),
+                "is_enabled": is_enabled,
+                "patterns": _pwa_patterns(w),
+                "value": _pwa_value(w),
+                "children": [],
+            }
+            if depth < max_depth:
+                try:
+                    for child in w.children():
+                        node["children"].append(_build_node(child, depth + 1))
+                except Exception:
+                    pass
+            return node
+
+        root_node = _build_node(wrapper, 0)
+        return [root_node]
+
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Strategy 2: comtypes IUIAutomation fallback
+    try:
+        import comtypes.client as _cc2  # type: ignore
+        import comtypes.gen.UIAutomationClient as _uia2  # type: ignore
+
+        _CT_NAMES = {
+            50000: "Button", 50001: "Calendar", 50002: "CheckBox",
+            50003: "ComboBox", 50004: "Edit", 50005: "Hyperlink",
+            50006: "Image", 50007: "ListItem", 50008: "List",
+            50009: "Menu", 50010: "MenuBar", 50011: "MenuItem",
+            50012: "ProgressBar", 50013: "RadioButton", 50014: "ScrollBar",
+            50015: "Slider", 50016: "Spinner", 50017: "StatusBar",
+            50018: "Tab", 50019: "TabItem", 50020: "Text",
+            50021: "ToolBar", 50022: "ToolTip", 50023: "Tree",
+            50024: "TreeItem", 50025: "Custom", 50026: "Group",
+            50027: "Thumb", 50028: "DataGrid", 50029: "DataItem",
+            50030: "Document", 50031: "SplitButton", 50032: "Window",
+            50033: "Pane", 50034: "Header", 50035: "HeaderItem",
+            50036: "Table", 50037: "TitleBar", 50038: "Separator",
+        }
+
+        auto = _cc2.CreateObject(
+            "{ff48dba4-60ef-4201-aa87-54103eef594e}",
+            interface=_uia2.IUIAutomation,
+        )
+        elem = auto.ElementFromHandle(hwnd)
+        if elem is None:
+            return []
+
+        _UIA_INVOKE = 10000
+        _UIA_VALUE = 10002
+        _UIA_TOGGLE = 10015
+        _UIA_EXPAND = 10005
+        _UIA_SELECT = 10010
+        _UIA_SCROLL = 10004
+
+        def _ct_patterns(e) -> list:
+            pats = []
+            for pid, name in [(_UIA_INVOKE, "Invoke"), (_UIA_VALUE, "Value"),
+                               (_UIA_TOGGLE, "Toggle"), (_UIA_EXPAND, "ExpandCollapse"),
+                               (_UIA_SELECT, "SelectionItem"), (_UIA_SCROLL, "Scroll")]:
+                try:
+                    p = e.GetCurrentPattern(pid)
+                    if p is not None:
+                        pats.append(name)
+                except Exception:
+                    pass
+            return pats
+
+        def _ct_value(e) -> str:
+            try:
+                p = e.GetCurrentPattern(_UIA_VALUE)
+                if p is not None:
+                    return p.QueryInterface(
+                        _uia2.IUIAutomationValuePattern
+                    ).CurrentValue or ""
+            except Exception:
+                pass
+            return ""
+
+        def _ct_rect(e) -> dict:
+            try:
+                r = e.CurrentBoundingRectangle
+                return {"left": r.left, "top": r.top,
+                        "right": r.right, "bottom": r.bottom}
+            except Exception:
+                return {"left": 0, "top": 0, "right": 0, "bottom": 0}
+
+        condition = auto.CreateTrueCondition()
+        walker = auto.CreateTreeWalker(condition)
+
+        def _build_ct_node(e, depth: int) -> dict:
+            ct_id = 0
+            try:
+                ct_id = e.CurrentControlType
+            except Exception:
+                pass
+            name = ""
+            try:
+                name = e.CurrentName or ""
+            except Exception:
+                pass
+            class_name = ""
+            try:
+                class_name = e.CurrentClassName or ""
+            except Exception:
+                pass
+            auto_id = ""
+            try:
+                auto_id = e.CurrentAutomationId or ""
+            except Exception:
+                pass
+            is_enabled = True
+            try:
+                is_enabled = bool(e.CurrentIsEnabled)
+            except Exception:
+                pass
+
+            node: dict = {
+                "name": name,
+                "control_type": _CT_NAMES.get(ct_id, f"Unknown({ct_id})"),
+                "class_name": class_name,
+                "automation_id": auto_id,
+                "rect": _ct_rect(e),
+                "is_enabled": is_enabled,
+                "patterns": _ct_patterns(e),
+                "value": _ct_value(e),
+                "children": [],
+            }
+            if depth < max_depth:
+                try:
+                    child = walker.GetFirstChildElement(e)
+                    while child:
+                        node["children"].append(_build_ct_node(child, depth + 1))
+                        child = walker.GetNextSiblingElement(child)
+                except Exception:
+                    pass
+            return node
+
+        root_node = _build_ct_node(elem, 0)
+        return [root_node]
+
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    return []
+
+
+def _flatten_tree(nodes: list, _out: "list | None" = None) -> list:
+    """Flatten a nested UI tree into a single list of nodes (without children lists)."""
+    if _out is None:
+        _out = []
+    for node in nodes:
+        children = node.get("children", [])
+        flat_node = {k: v for k, v in node.items() if k != "children"}
+        _out.append(flat_node)
+        _flatten_tree(children, _out)
+    return _out
+
+
+# ── ConPTY Own-Pipe Spawn (v0.10.0) ──────────────────────────────────────────
+class ConPTYHandle:
+    """Handle for a SelfConnect-spawned agent with direct ConPTY pipe I/O.
+
+    Created by spawn_agent_conpty(). Provides direct WriteFile/ReadFile access
+    to the agent's stdin/stdout -- same channel Windows Terminal uses internally.
+    Zero message-queue overhead.
+
+    Usage:
+        handle = spawn_agent_conpty(r'cmd.exe')
+        handle.write("dir\\r")
+        output = handle.read(timeout_ms=2000)
+        handle.close()
+    """
+
+    def __init__(self, h_pc, h_input_write, h_output_read, proc_info):
+        self._h_pc = h_pc
+        self._h_input_write = h_input_write   # WriteFile -> agent's stdin
+        self._h_output_read = h_output_read   # ReadFile  -> agent's stdout
+        self._proc_info = proc_info
+        self._closed = False
+
+    @property
+    def pid(self) -> int:
+        return self._proc_info.dwProcessId
+
+    @property
+    def hwnd(self) -> "int | None":
+        """Find the HWND of the spawned process (may take a moment to appear)."""
+        try:
+            for w in list_windows():
+                if w.pid == self._proc_info.dwProcessId:
+                    return w.hwnd
+        except Exception:
+            pass
+        return None
+
+    def write(self, text: str) -> int:
+        """Write text to the agent's stdin via the ConPTY pipe. Returns bytes written."""
+        if self._closed:
+            raise RuntimeError("ConPTYHandle is closed")
+        encoded = text.encode("utf-8")
+        written = wintypes.DWORD(0)
+        ok = kernel32.WriteFile(
+            self._h_input_write, encoded, len(encoded),
+            ctypes.byref(written), None,
+        )
+        return written.value if ok else 0
+
+    def read(self, timeout_ms: int = 1000) -> str:
+        """Read available output from the agent's stdout. Returns decoded string."""
+        if self._closed:
+            raise RuntimeError("ConPTYHandle is closed")
+
+        # Check if data available via PeekNamedPipe first
+        bytes_avail = wintypes.DWORD(0)
+        kernel32.PeekNamedPipe(
+            self._h_output_read, None, 0, None,
+            ctypes.byref(bytes_avail), None,
+        )
+
+        if bytes_avail.value == 0:
+            deadline = time.monotonic() + timeout_ms / 1000.0
+            while time.monotonic() < deadline:
+                time.sleep(0.05)
+                kernel32.PeekNamedPipe(
+                    self._h_output_read, None, 0, None,
+                    ctypes.byref(bytes_avail), None,
+                )
+                if bytes_avail.value > 0:
+                    break
+
+        if bytes_avail.value == 0:
+            return ""
+
+        buf = ctypes.create_string_buffer(min(bytes_avail.value, 65536))
+        read_count = wintypes.DWORD(0)
+        kernel32.ReadFile(
+            self._h_output_read, buf, len(buf),
+            ctypes.byref(read_count), None,
+        )
+        if read_count.value == 0:
+            return ""
+        return buf.raw[:read_count.value].decode("utf-8", errors="replace")
+
+    def flush_read(self, timeout_ms: int = 2000) -> str:
+        """Close the ConPTY to flush output, then drain all buffered data.
+
+        For short-lived commands (cmd.exe /c ...) that have already exited:
+        ClosePseudoConsole signals EOF on the output pipe, making all buffered
+        output available via PeekNamedPipe. Returns all remaining output.
+        After this call, read() will return "" and close() will skip ConPTY close.
+        """
+        if self._closed:
+            return ""
+        # Close the ConPTY — this flushes its internal buffer to our output pipe
+        try:
+            if self._h_pc:
+                kernel32.ClosePseudoConsole(self._h_pc)
+                self._h_pc = None
+        except Exception:
+            pass
+        # Drain all remaining data from the output pipe
+        all_data = b""
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            avail = wintypes.DWORD(0)
+            kernel32.PeekNamedPipe(
+                self._h_output_read, None, 0, None,
+                ctypes.byref(avail), None,
+            )
+            if avail.value == 0:
+                time.sleep(0.05)
+                continue
+            buf = ctypes.create_string_buffer(min(avail.value, 65536))
+            rc = wintypes.DWORD(0)
+            ok = kernel32.ReadFile(
+                self._h_output_read, buf, len(buf),
+                ctypes.byref(rc), None,
+            )
+            if not ok or rc.value == 0:
+                break
+            all_data += buf.raw[:rc.value]
+            # Brief pause to let ConPTY push any remaining bytes
+            time.sleep(0.02)
+        return all_data.decode("utf-8", errors="replace")
+
+    def close(self) -> None:
+        """Terminate the spawned process and release all handles."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            kernel32.TerminateProcess(self._proc_info.hProcess, 0)
+        except Exception:
+            pass
+        for h in (self._h_input_write, self._h_output_read,
+                  self._proc_info.hProcess, self._proc_info.hThread):
+            try:
+                if h:
+                    kernel32.CloseHandle(h)
+            except Exception:
+                pass
+        try:
+            if self._h_pc:
+                kernel32.ClosePseudoConsole(self._h_pc)
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def spawn_agent_conpty(
+    command: str,
+    cols: int = 120,
+    rows: int = 30,
+) -> "ConPTYHandle":
+    """Spawn a subprocess with SelfConnect-owned ConPTY pipes.
+
+    Returns a ConPTYHandle for direct WriteFile/ReadFile I/O with the spawned
+    process.  This is the fastest possible injection path -- same mechanism
+    Windows Terminal uses.
+
+    Args:
+        command: Command to run (e.g., "cmd.exe", "python -c '...'", "claude")
+        cols:    Console width in columns (default 120)
+        rows:    Console height in rows (default 30)
+
+    Returns:
+        ConPTYHandle -- call .write(), .read(), .close()
+
+    Raises:
+        OSError: If CreatePseudoConsole or CreateProcess fails.
+        RuntimeError: If ConPTY is not available (requires Windows 10 1809+).
+
+    Example:
+        with spawn_agent_conpty("cmd.exe") as h:
+            h.write("echo hello\\r")
+            output = h.read(timeout_ms=1000)
+            print(output)
+    """
+    if not hasattr(kernel32, "CreatePseudoConsole"):
+        raise RuntimeError(
+            "CreatePseudoConsole not available. "
+            "Requires Windows 10 build 17763+ (October 2018 Update)."
+        )
+
+    # Create pipe pair for stdin (host writes -> process reads)
+    h_pipe_in_read = wintypes.HANDLE()
+    h_pipe_in_write = wintypes.HANDLE()
+    if not kernel32.CreatePipe(
+        ctypes.byref(h_pipe_in_read), ctypes.byref(h_pipe_in_write),
+        None, 0,
+    ):
+        raise OSError(f"CreatePipe (stdin) failed: {ctypes.get_last_error()}")
+
+    # Create pipe pair for stdout (process writes -> host reads)
+    h_pipe_out_read = wintypes.HANDLE()
+    h_pipe_out_write = wintypes.HANDLE()
+    if not kernel32.CreatePipe(
+        ctypes.byref(h_pipe_out_read), ctypes.byref(h_pipe_out_write),
+        None, 0,
+    ):
+        kernel32.CloseHandle(h_pipe_in_read)
+        kernel32.CloseHandle(h_pipe_in_write)
+        raise OSError(f"CreatePipe (stdout) failed: {ctypes.get_last_error()}")
+
+    # Create the pseudo-console
+    coord = _COORD(cols, rows)
+    h_pc = ctypes.c_void_p()
+    hr = kernel32.CreatePseudoConsole(
+        coord,            # console size
+        h_pipe_in_read,   # hInput: process reads from here
+        h_pipe_out_write, # hOutput: process writes to here
+        0,                # dwFlags
+        ctypes.byref(h_pc),
+    )
+
+    if hr != 0:  # S_OK = 0
+        for h in (h_pipe_in_read, h_pipe_in_write,
+                  h_pipe_out_read, h_pipe_out_write):
+            kernel32.CloseHandle(h)
+        raise OSError(f"CreatePseudoConsole failed: HRESULT=0x{hr:08X}")
+
+    # These handles are now owned by the ConPTY -- close our copies
+    kernel32.CloseHandle(h_pipe_in_read)
+    kernel32.CloseHandle(h_pipe_out_write)
+
+    # Build STARTUPINFOEX with PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
+    attr_list_size = ctypes.c_size_t(0)
+    kernel32.InitializeProcThreadAttributeList(
+        None, 1, 0, ctypes.byref(attr_list_size),
+    )
+
+    attr_buf = ctypes.create_string_buffer(attr_list_size.value)
+    attr_list = ctypes.cast(attr_buf, ctypes.c_void_p)
+
+    if not kernel32.InitializeProcThreadAttributeList(
+        attr_list, 1, 0, ctypes.byref(attr_list_size),
+    ):
+        kernel32.ClosePseudoConsole(h_pc)
+        kernel32.CloseHandle(h_pipe_in_write)
+        kernel32.CloseHandle(h_pipe_out_read)
+        raise OSError(
+            f"InitializeProcThreadAttributeList failed: {ctypes.get_last_error()}"
+        )
+
+    if not kernel32.UpdateProcThreadAttribute(
+        attr_list, 0,
+        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+        h_pc, ctypes.sizeof(ctypes.c_void_p),
+        None, None,
+    ):
+        kernel32.DeleteProcThreadAttributeList(attr_list)
+        kernel32.ClosePseudoConsole(h_pc)
+        kernel32.CloseHandle(h_pipe_in_write)
+        kernel32.CloseHandle(h_pipe_out_read)
+        raise OSError(
+            f"UpdateProcThreadAttribute failed: {ctypes.get_last_error()}"
+        )
+
+    si_ex = _STARTUPINFOEX()
+    si_ex.StartupInfo.cb = ctypes.sizeof(_STARTUPINFOEX)
+    si_ex.lpAttributeList = attr_list
+
+    class _PROC_INFO(ctypes.Structure):
+        _fields_ = [
+            ("hProcess", wintypes.HANDLE),
+            ("hThread", wintypes.HANDLE),
+            ("dwProcessId", wintypes.DWORD),
+            ("dwThreadId", wintypes.DWORD),
+        ]
+    pi = _PROC_INFO()
+
+    EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+    CREATE_UNICODE_ENVIRONMENT   = 0x00000400
+    # Note: do NOT add CREATE_NO_WINDOW here — it prevents cmd.exe from connecting to the ConPTY
+    # The ConPTY itself is the "no visible window" mechanism for the process
+
+    cmd_buf = ctypes.create_unicode_buffer(command)
+
+    ok = kernel32.CreateProcessW(
+        None,       # lpApplicationName
+        cmd_buf,    # lpCommandLine
+        None,       # lpProcessAttributes
+        None,       # lpThreadAttributes
+        False,      # bInheritHandles
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+        None,       # lpEnvironment
+        None,       # lpCurrentDirectory
+        ctypes.byref(si_ex),
+        ctypes.byref(pi),
+    )
+
+    kernel32.DeleteProcThreadAttributeList(attr_list)
+
+    if not ok:
+        kernel32.ClosePseudoConsole(h_pc)
+        kernel32.CloseHandle(h_pipe_in_write)
+        kernel32.CloseHandle(h_pipe_out_read)
+        raise OSError(f"CreateProcessW failed: {ctypes.get_last_error()}")
+
+    return ConPTYHandle(h_pc, h_pipe_in_write, h_pipe_out_read, pi)
 
 
 # ── CLI: list windows ─────────────────────────────────────────────────────────
