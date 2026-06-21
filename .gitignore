@@ -20,6 +20,9 @@ briefing_*.md
 
 # Temporary session screenshots
 tmp_*.png
+/*.png
+!/proof_claude_design.png
+!/proof_claude_design2.png
 
 # Local Claude Code workspace state
 .claude/
