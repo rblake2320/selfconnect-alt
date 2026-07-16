@@ -1,5 +1,5 @@
 """Clean B roundtrip: inject task → wait → read → extract → execute once."""
-import sys, os, time, subprocess
+import sys, os, time, re
 sys.stdout.reconfigure(encoding='utf-8')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from self_connect import list_windows, send_string, get_text_uia
@@ -62,7 +62,6 @@ print(f"\nExecuting B's command:\n  {cmd[:120]}...")
 
 # SECURITY (#R-04): B's output is untrusted. Never shell-exec it. Extract the
 # 'python -c' snippet and run it opt-in only (SC_ALLOW_REMOTE_EXEC=1), no shell.
-import re
 m = re.match(r'''^python\s+-c\s+(['"])(?P<code>.*)\1\s*$''', cmd, re.DOTALL)
 if not m:
     print("Refused: not a recognized 'python -c' snippet.")
