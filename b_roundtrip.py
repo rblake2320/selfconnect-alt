@@ -3,6 +3,7 @@ import sys, os, time, subprocess
 sys.stdout.reconfigure(encoding='utf-8')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from self_connect import list_windows, send_string, get_text_uia
+from mesh_exec_guard import run_agent_python_snippet
 
 B_HWND = 0x01fa0d74
 A_HWND = 0x0ea80dfe
@@ -59,7 +60,16 @@ if not cmd_parts:
 cmd = ' '.join(cmd_parts)
 print(f"\nExecuting B's command:\n  {cmd[:120]}...")
 
-result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=SC_PATH)
+# SECURITY (#R-04): B's output is untrusted. Never shell-exec it. Extract the
+# 'python -c' snippet and run it opt-in only (SC_ALLOW_REMOTE_EXEC=1), no shell.
+import re
+m = re.match(r'''^python\s+-c\s+(['"])(?P<code>.*)\1\s*$''', cmd, re.DOTALL)
+if not m:
+    print("Refused: not a recognized 'python -c' snippet.")
+    sys.exit(1)
+result = run_agent_python_snippet(m.group('code'), cwd=SC_PATH)
+if result is None:
+    sys.exit(1)  # refused (opt-in not set)
 if result.returncode == 0:
     print("Done — watch for B-REPLY in Agent-A's input.")
 else:

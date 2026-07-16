@@ -3,6 +3,7 @@ import sys, os, time
 sys.stdout.reconfigure(encoding='utf-8')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from self_connect import list_windows, send_string, get_text_uia
+from mesh_exec_guard import run_allowlisted_script, UnsafeCommand
 
 B_HWND = 0x01fa0d74
 SC_DIR = 'C:/Users/techai/PKA testing/selfconnect'
@@ -73,10 +74,14 @@ cmd = next(
     None
 )
 if cmd:
-    import subprocess
+    # SECURITY (#R-04): B's output is untrusted. Only the two allowlisted
+    # reply scripts may run, argv-only (no shell), args validated.
     print(f'Executing: {cmd}')
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=SC_DIR)
-    print('stdout:', r.stdout.strip())
-    print('stderr:', r.stderr.strip()[:200])
+    try:
+        r = run_allowlisted_script(cmd, ('b_send.py', 'b_reply.py'), cwd=SC_DIR)
+        print('stdout:', r.stdout.strip())
+        print('stderr:', r.stderr.strip()[:200])
+    except UnsafeCommand as e:
+        print(f'Refused unsafe command from B: {e}')
 else:
     print('No reply command found in B output yet.')

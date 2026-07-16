@@ -6,6 +6,7 @@ import sys, os, time, subprocess, re
 sys.stdout.reconfigure(encoding='utf-8')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from self_connect import get_text_uia
+from mesh_exec_guard import run_agent_python_snippet
 
 B_HWND = 0x01fa0d74
 POLL_INTERVAL = 2  # seconds
@@ -47,14 +48,20 @@ while True:
             seen_commands.add(cmd)
 
             print(f"\n[watcher] NEW command from B:\n  {cmd[:120]}...")
-            print("[watcher] Executing...")
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                cwd="C:/Users/techai/PKA testing/selfconnect"
+            # SECURITY (#R-04): B's output is untrusted. Never shell-exec it.
+            # 'python -c <snippet>' from a peer agent is arbitrary code
+            # execution, so it is opt-in only (SC_ALLOW_REMOTE_EXEC=1) and runs
+            # without a shell.
+            m = re.match(r'''^python\s+-c\s+(['"])(?P<code>.*)\1\s*$''', cmd, re.DOTALL)
+            if not m:
+                print("[watcher] SKIP: not a recognized 'python -c' snippet")
+                continue
+            result = run_agent_python_snippet(
+                m.group('code'),
+                cwd="C:/Users/techai/PKA testing/selfconnect",
             )
+            if result is None:
+                continue  # refused (opt-in not set)
             if result.returncode == 0:
                 print(f"[watcher] OK — {result.stdout.strip()}")
             else:
