@@ -20,16 +20,16 @@ This runs as a background sidecar process.
 
 from __future__ import annotations
 
-import sys
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-
 import argparse
 import fnmatch
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ── SelfConnect import ────────────────────────────────────────────────────────
 try:

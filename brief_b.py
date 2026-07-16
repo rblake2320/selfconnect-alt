@@ -1,9 +1,11 @@
 """Brief Agent B (qwen3.6 in ollama run) with full SelfConnect SDK knowledge."""
-import sys, os, time
+import sys
+import time
+
+from mesh_exec_guard import UnsafeCommand, run_allowlisted_script
+from self_connect import get_text_uia, list_windows, send_string
+
 sys.stdout.reconfigure(encoding='utf-8')
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from self_connect import list_windows, send_string, get_text_uia
-from mesh_exec_guard import run_allowlisted_script, UnsafeCommand
 
 B_HWND = 0x01fa0d74
 SC_DIR = 'C:/Users/techai/PKA testing/selfconnect'
@@ -69,8 +71,8 @@ print('--- end ---\n')
 # Execute B's reply if it output the expected command
 lines = after.splitlines()
 cmd = next(
-    (l.strip() for l in reversed(lines)
-     if l.strip().startswith('python b_send.py') or l.strip().startswith('python b_reply.py')),
+    (line.strip() for line in reversed(lines)
+     if line.strip().startswith('python b_send.py') or line.strip().startswith('python b_reply.py')),
     None
 )
 if cmd:
