@@ -1,8 +1,11 @@
 """Brief Agent B (qwen3.6 in ollama run) with full SelfConnect SDK knowledge."""
-import sys, os, time
+import sys
+import time
+
+from mesh_exec_guard import UnsafeCommand, run_allowlisted_script
+from self_connect import get_text_uia, list_windows, send_string
+
 sys.stdout.reconfigure(encoding='utf-8')
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from self_connect import list_windows, send_string, get_text_uia
 
 B_HWND = 0x01fa0d74
 SC_DIR = 'C:/Users/techai/PKA testing/selfconnect'
@@ -68,15 +71,19 @@ print('--- end ---\n')
 # Execute B's reply if it output the expected command
 lines = after.splitlines()
 cmd = next(
-    (l.strip() for l in reversed(lines)
-     if l.strip().startswith('python b_send.py') or l.strip().startswith('python b_reply.py')),
+    (line.strip() for line in reversed(lines)
+     if line.strip().startswith('python b_send.py') or line.strip().startswith('python b_reply.py')),
     None
 )
 if cmd:
-    import subprocess
+    # SECURITY (#R-04): B's output is untrusted. Only the two allowlisted
+    # reply scripts may run, argv-only (no shell), args validated.
     print(f'Executing: {cmd}')
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=SC_DIR)
-    print('stdout:', r.stdout.strip())
-    print('stderr:', r.stderr.strip()[:200])
+    try:
+        r = run_allowlisted_script(cmd, ('b_send.py', 'b_reply.py'), cwd=SC_DIR)
+        print('stdout:', r.stdout.strip())
+        print('stderr:', r.stderr.strip()[:200])
+    except UnsafeCommand as e:
+        print(f'Refused unsafe command from B: {e}')
 else:
     print('No reply command found in B output yet.')

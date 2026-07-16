@@ -3062,7 +3062,14 @@ def _get_ui_tree_cached(hwnd: int, max_depth: int = 10) -> "list[dict] | None":
     """
     try:
         import comtypes.client as _cc  # type: ignore
-        import comtypes.gen.UIAutomationClient as _uia_gen  # type: ignore
+        try:
+            import comtypes.gen.UIAutomationClient as _uia_gen  # type: ignore
+        except ImportError:
+            # A clean installation has no generated UIA bindings yet. Generate
+            # them from the Windows type library instead of depending on a
+            # previous interactive comtypes call having populated the cache.
+            _cc.GetModule("UIAutomationCore.dll")
+            import comtypes.gen.UIAutomationClient as _uia_gen  # type: ignore
 
         # Get IUIAutomation interface (must specify interface — IUnknown has no UIA methods)
         _uia_clsid = "{ff48dba4-60ef-4201-aa87-54103eef594e}"

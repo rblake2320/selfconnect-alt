@@ -29,6 +29,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+test = [
+    "pytest>=9.0.0",
+    "pytest-asyncio>=1.0.0",
+]
 uia = [
     "pywinauto>=0.6.8",
 ]
@@ -68,3 +72,4 @@ include = ["self_connect.py", "claudego/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "test_self_connect.py"]
+asyncio_default_fixture_loop_scope = "function"
